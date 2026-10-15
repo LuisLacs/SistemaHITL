@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  postgres_db:
+    image: postgres:15
+    container_name: cidesi_postgres
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: rootpassword
+      POSTGRES_DB: hitl_users
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  mongo_db:
+    image: mongo:6
+    container_name: cidesi_mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: rootpassword
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodata:/data/db
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  mongodata:
