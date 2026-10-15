@@ -41,12 +41,13 @@ export default function Register() {
     setLoading(true);
 
     try {
-      const response = await axios.post('http://localhost:3000/api/auth/register', {
-        nombre,
-        email,
-        password,
-        rol: 'Experto'
-      });
+        const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+        const response = await axios.post(`${BASE_URL}/api/auth/register`, {
+            nombre,
+            email,
+            password,
+            rol: 'Experto'
+        });
 
       // Si el backend devuelve el token directamente, iniciamos sesión de inmediato
       if (response.data?.token) {

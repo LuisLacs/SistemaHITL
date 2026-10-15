@@ -3,7 +3,8 @@ import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import '../styles/scientific-ui.css';
 
-const API_URL = 'http://localhost:3000/api/annotations';
+const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+const API_URL = `${BASE_URL}/api/annotations`;
 
 export default function Anotador() {
   const navigate = useNavigate();
