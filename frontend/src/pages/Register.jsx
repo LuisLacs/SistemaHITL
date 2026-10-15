@@ -184,7 +184,7 @@ export default function Register() {
             <input
               type="text"
               className="input-field"
-              placeholder="Ej. Dr. Ángel Iván García Moreno"
+              placeholder="Tu nombre completo"
               value={nombre}
               onChange={(e) => setNombre(e.target.value)}
               required
@@ -198,7 +198,7 @@ export default function Register() {
             <input
               type="email"
               className="input-field"
-              placeholder="ivan.garcia@cidesi.edu.mx"
+              placeholder="tu.correo@cidesi.edu.mx"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               required
