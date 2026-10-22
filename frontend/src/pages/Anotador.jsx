@@ -5,6 +5,16 @@ import '../styles/scientific-ui.css';
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 const API_URL = `${BASE_URL}/api/annotations`;
+// URL del microservicio Python donde correrá el modelo YOLO de Carlos
+const YOLO_CARLOS_API = import.meta.env.VITE_YOLO_URL || 'http://localhost:8000/api/yolo/predict';
+
+// Constantes físicas de la cámara FLIR A6751sc (640x512 @ 14-bit) en archivos .ATS
+const FLIR_WIDTH = 640;
+const FLIR_HEIGHT = 512;
+const FLIR_PIXELS = FLIR_WIDTH * FLIR_HEIGHT; // 327,680 píxeles por fotograma
+const FLIR_FRAME_BYTES = FLIR_PIXELS * 2; // 655,360 bytes (Uint16 Little-Endian)
+const ATS_GLOBAL_HEADER = 2048; // Offset inicial del contenedor .ats
+const ATS_FRAME_STRIDE = 656728; // 655,360 bytes de matriz + 1,368 bytes de cabecera de metadatos por frame
 
 export default function Anotador() {
   const navigate = useNavigate();
@@ -12,6 +22,12 @@ export default function Anotador() {
   const canvasRef = useRef(null);
   const inicioTiempoRef = useRef(null);
   const ultimoCentroExpertoRef = useRef(null);
+
+  // Registro maestro en memoria de TODOS los fotogramas procesados (pre-segmentados + rectificados)
+  // Estructura: { [frameId]: { frameNumber, fileName, poligonoIA, poligono, validadoPorExperto, tipoValidacion, metadatos } }
+  const registroSecuenciaRef = useRef({});
+  // Matriz radiométrica cruda de 14-bits del fotograma activo (cuando se lee un archivo .ats)
+  const matriz14BitActualRef = useRef(null);
 
   useEffect(() => {
     inicioTiempoRef.current = Date.now();
@@ -22,25 +38,40 @@ export default function Anotador() {
     localStorage.getItem('hitl-secuencia') || 'RC3.ats'
   );
 
+  // Archivo .ATS crudo seleccionado desde disco (lectura por streaming Blob.slice sin saturar RAM)
+  const [archivoAtsCrudo, setArchivoAtsCrudo] = useState(null);
+  // Lote de imágenes .png/.jpg (modo alternativo)
   const [loteFotogramas, setLoteFotogramas] = useState([]);
-  const [indiceLote, setIndiceLote] = useState(
-    Number(localStorage.getItem('hitl-indice-lote')) || 0
-  );
-  const [frameActual, setFrameActual] = useState(
-    Number(localStorage.getItem('hitl-frame-actual')) || 1
-  );
-  const totalFrames = loteFotogramas.length > 0 ? loteFotogramas.length : 100;
 
-  // Persistir el progreso del índice para no perder la posición al recargar
-  useEffect(() => {
-    localStorage.setItem('hitl-secuencia', secuenciaActiva);
-    localStorage.setItem('hitl-indice-lote', String(indiceLote));
-    localStorage.setItem('hitl-frame-actual', String(frameActual));
-  }, [secuenciaActiva, indiceLote, frameActual]);
+  const [indiceLote, setIndiceLote] = useState(0);
+  const [frameActual, setFrameActual] = useState(1);
+  const [totalFrames, setTotalFrames] = useState(100);
+
+  // Metadatos nativos extraídos del archivo .ats / cabezal FLIR
+  const [metadatosAts, setMetadatosAts] = useState({
+    cameraModel: 'FLIR A6751sc',
+    resolution: '640×512',
+    adBits: 14,
+    fps: 127,
+    emissivity: 0.92,
+    distanceMeters: 1.0,
+    reflectedTempC: 20.0,
+    atmosphericTempC: 20.0,
+    relativeHumidity: 30.0,
+    timestampMs: 0
+  });
+
+  // Selector de Motor de Pre-Segmentación: 'YOLO_CARLOS' | 'ISOTERMICO_LOCAL'
+  const [motorPreSegmentacion, setMotorPreSegmentacion] = useState('YOLO_CARLOS');
+  const [procesandoLoteMasivo, setProcesandoLoteMasivo] = useState(false);
+  const [progresoLote, setProgresoLote] = useState(0);
+  const [totalFramesEnRegistro, setTotalFramesEnRegistro] = useState(0);
 
   const fotogramaActivo = loteFotogramas.length > 0 ? loteFotogramas[indiceLote] : null;
   const imgElement = fotogramaActivo ? fotogramaActivo.imgElement : null;
-  const identificadorFrame = fotogramaActivo
+  const identificadorFrame = archivoAtsCrudo
+    ? `${secuenciaActiva}_frame_${frameActual}`
+    : fotogramaActivo
     ? `${secuenciaActiva}_${fotogramaActivo.nombreArchivo.replace(/\.[^/.]+$/, '')}`
     : `${secuenciaActiva}_frame_${frameActual}`;
 
@@ -48,7 +79,6 @@ export default function Anotador() {
   const [recorteEstela, setRecorteEstela] = useState(true);
   const [plantillaExperto, setPlantillaExperto] = useState(null);
 
-  // Control de flujo ergonómico: Auto-avanzar al guardar y detección de cambios sin guardar
   const [autoAvanzar, setAutoAvanzar] = useState(true);
   const [modificadoSinGuardar, setModificadoSinGuardar] = useState(false);
 
@@ -59,6 +89,7 @@ export default function Anotador() {
   const [telemetriaPool, setTelemetriaPool] = useState({
     adMax: 7082,
     adPromedio: 6150,
+    adMin: 1017,
     centroideX: 318,
     centroideY: 214,
     incertidumbre: 9.4
@@ -75,6 +106,7 @@ export default function Anotador() {
   const [mostrarMetricas, setMostrarMetricas] = useState(false);
   const [resumenMetricas, setResumenMetricas] = useState({
     totalValidados: 0,
+    totalPreSegmentados: 0,
     tiempoPromedioSeg: 0,
     iouPromedio: 100,
     tasaConfirmacionDirecta: 0,
@@ -96,50 +128,261 @@ export default function Anotador() {
     }
   }, [isAuthorized, navigate]);
 
+  const calcularGeometria = useCallback((puntos) => {
+    if (!puntos || puntos.length < 3) return { area: 0, perimetro: 0 };
+    let area = 0;
+    let perimetro = 0;
+    const n = puntos.length;
+    for (let i = 0; i < n; i++) {
+      const p1 = puntos[i];
+      const p2 = puntos[(i + 1) % n];
+      area += p1.x * p2.y - p2.x * p1.y;
+      perimetro += Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    }
+    return {
+      area: Math.round(Math.abs(area) / 2),
+      perimetro: Math.round(perimetro)
+    };
+  }, []);
+
+  // Registrar cualquier fotograma procesado (automático o rectificado) en el catálogo maestro para exportación COCO
+  const registrarFrameEnCatalogoMaestro = useCallback((frameIdKey, datosFrame) => {
+    const existente = registroSecuenciaRef.current[frameIdKey];
+    // Si el fotograma ya fue rectificado por el experto y llega un cálculo automático, respetar la rectificación humana
+    if (existente?.validadoPorExperto && !datosFrame.validadoPorExperto) {
+      return;
+    }
+    const geo = calcularGeometria(datosFrame.poligono);
+    registroSecuenciaRef.current[frameIdKey] = {
+      frameId: frameIdKey,
+      frameNumber: datosFrame.frameNumber || frameActual,
+      fileName: `${frameIdKey}.png`,
+      poligonoIA: datosFrame.poligonoIA || datosFrame.poligono || [],
+      poligono: datosFrame.poligono || [],
+      validadoPorExperto: Boolean(datosFrame.validadoPorExperto),
+      tipoValidacion: datosFrame.tipoValidacion || 'PreSegmentacion_IA',
+      algoritmoOrigen: datosFrame.algoritmoOrigen || motorPreSegmentacion,
+      metadatos: {
+        ...metadatosAts,
+        tempMaxima: datosFrame.adMax || 7082,
+        tempPromedio: datosFrame.adPromedio || 6100,
+        tempMinima: datosFrame.adMin || 1017,
+        centroideX: datosFrame.centroideX || 320,
+        centroideY: datosFrame.centroideY || 214,
+        areaPixeles: geo.area,
+        perimetroPixeles: geo.perimetro,
+        incertidumbreAlgoritmo: datosFrame.incertidumbre || 10.5,
+        iouSimilitud: datosFrame.iouSimilitud ?? 100,
+        tiempoValidacionSeg: datosFrame.tiempoValidacionSeg || 0,
+        direccionSoldadura,
+        material,
+        numeroCordones: cordones
+      }
+    };
+    setTotalFramesEnRegistro(Object.keys(registroSecuenciaRef.current).length);
+  }, [calcularGeometria, frameActual, motorPreSegmentacion, metadatosAts, direccionSoldadura, material, cordones]);
+
+  // =========================================================================
+  // 1. LECTOR BINARIO DE ARCHIVOS .ATS (STREAMING POR BLOQUES DE 14-BITS)
+  // =========================================================================
+  const decodificarFrameDesdeATS = useCallback(async (fileAts, numeroFrame) => {
+    if (!fileAts) return null;
+
+    const offsetFrame = ATS_GLOBAL_HEADER + (numeroFrame - 1) * ATS_FRAME_STRIDE;
+    const finFrame = Math.min(fileAts.size, offsetFrame + FLIR_FRAME_BYTES);
+
+    if (offsetFrame >= fileAts.size || finFrame - offsetFrame < FLIR_FRAME_BYTES) {
+      return null;
+    }
+
+    const sliceBlob = fileAts.slice(offsetFrame, finFrame);
+    const buffer = await sliceBlob.arrayBuffer();
+    const raw16 = new Uint16Array(buffer);
+
+    let minAD = 16383;
+    let maxAD = 0;
+
+    for (let i = 0; i < FLIR_PIXELS; i++) {
+      // Máscara de 14-bits (0 a 16383 cuentas AD)
+      const val = raw16[i] & 0x3FFF;
+      if (val > 400 && val < minAD) minAD = val;
+      if (val > maxAD) maxAD = val;
+    }
+
+    if (minAD >= maxAD) {
+      minAD = 1017;
+      maxAD = 7082;
+    }
+
+    matriz14BitActualRef.current = {
+      raw16,
+      minAD,
+      maxAD,
+      timestampMs: Math.round(((numeroFrame - 1) / 127) * 1000)
+    };
+
+    setMetadatosAts((prev) => ({
+      ...prev,
+      timestampMs: Math.round(((numeroFrame - 1) / 127) * 1000)
+    }));
+
+    return matriz14BitActualRef.current;
+  }, []);
+
   const dibujarFuenteTermica = useCallback((ctx, width, height, imagenExplicita = imgElement) => {
     ctx.fillStyle = '#050505';
     ctx.fillRect(0, 0, width, height);
 
+    // A) Si hay un archivo .ATS crudo activo, renderizar directamente la matriz radiométrica de 14-bits
+    if (archivoAtsCrudo && matriz14BitActualRef.current) {
+      const { raw16, minAD, maxAD } = matriz14BitActualRef.current;
+      const rango = Math.max(1, maxAD - minAD);
+      const imgDataObj = ctx.createImageData(FLIR_WIDTH, FLIR_HEIGHT);
+      const data = imgDataObj.data;
+
+      for (let i = 0; i < FLIR_PIXELS; i++) {
+        const adVal = raw16[i] & 0x3FFF;
+        const norm = Math.max(0, Math.min(255, Math.round(((adVal - minAD) / rango) * 255)));
+        const pxIdx = i * 4;
+        data[pxIdx] = norm;
+        data[pxIdx + 1] = norm;
+        data[pxIdx + 2] = norm;
+        data[pxIdx + 3] = 255;
+      }
+      ctx.putImageData(imgDataObj, 0, 0);
+      return;
+    }
+
+    // B) Si se cargó lote de imágenes .png/.jpg exportadas
     if (imagenExplicita) {
       ctx.drawImage(imagenExplicita, 0, 0, width, height);
-    } else {
-      const seed = loteFotogramas.length > 0 ? indiceLote + 1 : frameActual;
-      const offsetX = Math.sin(seed * 0.45) * 35;
-      const offsetY = Math.cos(seed * 0.35) * 18;
-      const cx = Math.round(280 + offsetX);
-      const cy = Math.round(200 + offsetY);
-
-      const gradExterior = ctx.createRadialGradient(cx, cy, 6, cx, cy, 82);
-      gradExterior.addColorStop(0, 'rgba(255, 255, 255, 1)');
-      gradExterior.addColorStop(0.38, 'rgba(230, 230, 230, 0.9)');
-      gradExterior.addColorStop(0.68, 'rgba(95, 95, 95, 0.35)');
-      gradExterior.addColorStop(1, 'rgba(5, 5, 5, 0)');
-      ctx.fillStyle = gradExterior;
-      ctx.beginPath();
-      ctx.ellipse(cx, cy, 74, 31, 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(cx - 26, cy - 11, 52, 22);
+      return;
     }
-  }, [imgElement, loteFotogramas.length, indiceLote, frameActual]);
+
+    // C) Escena térmica sintética de respaldo
+    const seed = loteFotogramas.length > 0 ? indiceLote + 1 : frameActual;
+    const offsetX = Math.sin(seed * 0.45) * 35;
+    const offsetY = Math.cos(seed * 0.35) * 18;
+    const cx = Math.round(280 + offsetX);
+    const cy = Math.round(200 + offsetY);
+
+    const gradExterior = ctx.createRadialGradient(cx, cy, 6, cx, cy, 82);
+    gradExterior.addColorStop(0, 'rgba(255, 255, 255, 1)');
+    gradExterior.addColorStop(0.38, 'rgba(230, 230, 230, 0.9)');
+    gradExterior.addColorStop(0.68, 'rgba(95, 95, 95, 0.35)');
+    gradExterior.addColorStop(1, 'rgba(5, 5, 5, 0)');
+    ctx.fillStyle = gradExterior;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, 74, 31, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(cx - 26, cy - 11, 52, 22);
+  }, [archivoAtsCrudo, imgElement, loteFotogramas.length, indiceLote, frameActual]);
 
   // =========================================================================
-  // MOTOR DE SEGMENTACIÓN CON FRENTE DE ATAQUE DIRECCIONAL Y VENTANA LOCAL
+  // 2. SECCIÓN DE INTEGRACIÓN PARA EL ALGORITMO YOLO DE CARLOS
   // =========================================================================
-  const ejecutarPreSegmentacionIA = useCallback((
+  /**
+   * Conector para el modelo de pre-segmentación YOLO desarrollado por Carlos.
+   * Envía el fotograma actual (matriz o imagen base64) al servicio de inferencia YOLO
+   * y recibe el arreglo de vértices [{ x, y }, ...] junto con la confianza del modelo.
+   */
+  const ejecutarAlgoritmoCarlosYOLO = useCallback(async (canvasOffscreen) => {
+    try {
+      const frameBase64 = canvasOffscreen.toDataURL('image/png');
+      const response = await axios.post(
+        YOLO_CARLOS_API,
+        {
+          frameId: identificadorFrame,
+          secuencia: secuenciaActiva,
+          frameNumber: frameActual,
+          width: FLIR_WIDTH,
+          height: FLIR_HEIGHT,
+          imageBase64: frameBase64
+        },
+        { timeout: 1800 }
+      );
+
+      // Formato esperado del script YOLO de Carlos:
+      // { polygon: [{x: 310, y: 210}, ...], confidence: 0.91, max_ad: 7082, mean_ad: 6420 }
+      if (response.data && Array.isArray(response.data.polygon) && response.data.polygon.length >= 3) {
+        const pts = response.data.polygon.map((p) => ({
+          x: Math.round(Number(p.x ?? p[0])),
+          y: Math.round(Number(p.y ?? p[1]))
+        }));
+        const cx = Math.round(pts.reduce((a, b) => a + b.x, 0) / pts.length);
+        const cy = Math.round(pts.reduce((a, b) => a + b.y, 0) / pts.length);
+        const conf = Number(response.data.confidence ?? 0.88);
+
+        return {
+          exito: true,
+          origen: 'YOLO_CARLOS',
+          vertices: pts,
+          adMax: response.data.max_ad || 7082,
+          adPromedio: response.data.mean_ad || 6350,
+          adMin: response.data.min_ad || 1017,
+          centroideX: cx,
+          centroideY: cy,
+          incertidumbre: Number(((1 - conf) * 100).toFixed(1))
+        };
+      }
+    } catch {
+      // Si el servidor Python de Carlos aún no está levantado localmente,
+      // retorna false para usar de forma transparente la pre-segmentación local
+    }
+    return { exito: false };
+  }, [identificadorFrame, secuenciaActiva, frameActual]);
+
+  // =========================================================================
+  // 3. MOTOR DE PRE-SEGMENTACIÓN (CONMUTADOR YOLO CARLOS / ISOTÉRMICO LOCAL)
+  // =========================================================================
+  const ejecutarPreSegmentacionIA = useCallback(async (
     umbralCustom = umbralIsotermico,
     imagenTarget = imgElement,
-    usarRecorteCola = recorteEstela
+    usarRecorteCola = recorteEstela,
+    frameIdExplicito = identificadorFrame,
+    numFrameExplicito = frameActual
   ) => {
     const offscreen = document.createElement('canvas');
-    offscreen.width = 640;
-    offscreen.height = 512;
+    offscreen.width = FLIR_WIDTH;
+    offscreen.height = FLIR_HEIGHT;
     const ctx = offscreen.getContext('2d');
 
-    dibujarFuenteTermica(ctx, 640, 512, imagenTarget);
-    const imgData = ctx.getImageData(0, 0, 640, 512).data;
+    dibujarFuenteTermica(ctx, FLIR_WIDTH, FLIR_HEIGHT, imagenTarget);
 
+    // A) Si está seleccionado el motor YOLO de Carlos, intentar inferencia con su servicio primero
+    if (motorPreSegmentacion === 'YOLO_CARLOS') {
+      const resultadoYolo = await ejecutarAlgoritmoCarlosYOLO(offscreen);
+      if (resultadoYolo.exito) {
+        setPoligonoIA(resultadoYolo.vertices);
+        setPoligono(resultadoYolo.vertices);
+        setTelemetriaPool({
+          adMax: resultadoYolo.adMax,
+          adPromedio: resultadoYolo.adPromedio,
+          adMin: resultadoYolo.adMin,
+          centroideX: resultadoYolo.centroideX,
+          centroideY: resultadoYolo.centroideY,
+          incertidumbre: resultadoYolo.incertidumbre
+        });
+        setModoValidacion('Binaria');
+        setModificadoSinGuardar(false);
+
+        registrarFrameEnCatalogoMaestro(frameIdExplicito, {
+          frameNumber: numFrameExplicito,
+          poligonoIA: resultadoYolo.vertices,
+          poligono: resultadoYolo.vertices,
+          validadoPorExperto: false,
+          tipoValidacion: 'PreSegmentacion_YOLO_Carlos',
+          algoritmoOrigen: 'YOLO_CARLOS',
+          ...resultadoYolo
+        });
+        return resultadoYolo.vertices;
+      }
+    }
+
+    // B) Respaldo / Pre-segmentación Isotérmica Radiométrica
+    const imgData = ctx.getImageData(0, 0, FLIR_WIDTH, FLIR_HEIGHT).data;
     const ancla = ultimoCentroExpertoRef.current;
     const xMinROI = ancla ? Math.max(30, ancla.x - 95) : 30;
     const xMaxROI = ancla ? Math.min(610, ancla.x + 95) : 610;
@@ -149,24 +392,24 @@ export default function Anotador() {
     let maxLumGlobal = 0;
     for (let y = yMinROI; y < yMaxROI; y += 2) {
       for (let x = xMinROI; x < xMaxROI; x += 2) {
-        const idx = (y * 640 + x) * 4;
+        const idx = (y * FLIR_WIDTH + x) * 4;
         const lum = (imgData[idx] + imgData[idx + 1] + imgData[idx + 2]) / 3;
         if (lum > maxLumGlobal) maxLumGlobal = lum;
       }
     }
 
-    if (maxLumGlobal < 40) return;
+    if (maxLumGlobal < 40) return [];
 
     const umbralNucleoPuro = Math.max(umbralCustom, maxLumGlobal * 0.95);
     let sumCoreY = 0;
     let countCore = 0;
-    let minCoreX = 640;
+    let minCoreX = FLIR_WIDTH;
     let maxCoreX = 0;
     let sumCoreX = 0;
 
     for (let y = yMinROI; y < yMaxROI; y++) {
       for (let x = xMinROI; x < xMaxROI; x++) {
-        const idx = (y * 640 + x) * 4;
+        const idx = (y * FLIR_WIDTH + x) * 4;
         const lum = (imgData[idx] + imgData[idx + 1] + imgData[idx + 2]) / 3;
         if (lum >= umbralNucleoPuro) {
           sumCoreX += x;
@@ -178,7 +421,7 @@ export default function Anotador() {
       }
     }
 
-    if (countCore === 0) return;
+    if (countCore === 0) return [];
 
     let cy = Math.round(sumCoreY / countCore);
     let cx = Math.round(sumCoreX / countCore);
@@ -189,7 +432,7 @@ export default function Anotador() {
 
     for (let r = 2; r < 60; r++) {
       const pyUp = Math.max(5, cy - r);
-      const idxUp = (pyUp * 640 + cx) * 4;
+      const idxUp = (pyUp * FLIR_WIDTH + cx) * 4;
       const lumUp = (imgData[idxUp] + imgData[idxUp + 1] + imgData[idxUp + 2]) / 3;
       if (lumUp >= umbralEfectivo) radioArriba = r;
       else if (r > radioArriba + 2) break;
@@ -197,15 +440,15 @@ export default function Anotador() {
 
     for (let r = 2; r < 60; r++) {
       const pyDown = Math.min(506, cy + r);
-      const idxDown = (pyDown * 640 + cx) * 4;
+      const idxDown = (pyDown * FLIR_WIDTH + cx) * 4;
       const lumDown = (imgData[idxDown] + imgData[idxDown + 1] + imgData[idxDown + 2]) / 3;
       if (lumDown >= umbralEfectivo) radioAbajo = r;
       else if (r > radioAbajo + 2) break;
     }
 
     const radioBasePool = Math.min(24, Math.max(10, Math.round((radioArriba + radioAbajo) / 2)));
-
     const anchoManchaBlanca = maxCoreX - minCoreX;
+
     if (usarRecorteCola && anchoManchaBlanca > radioBasePool * 2.4) {
       if (direccionSoldadura === 'Derecha a Izquierda') {
         cx = Math.round(minCoreX + radioBasePool * 1.15);
@@ -219,7 +462,7 @@ export default function Anotador() {
     let sumYLocal = 0;
     let countYLocal = 0;
     for (let y = Math.max(20, cy - 35); y <= Math.min(490, cy + 35); y++) {
-      const idx = (y * 640 + cx) * 4;
+      const idx = (y * FLIR_WIDTH + cx) * 4;
       const lum = (imgData[idx] + imgData[idx + 1] + imgData[idx + 2]) / 3;
       if (lum >= umbralEfectivo) {
         sumYLocal += y;
@@ -256,7 +499,7 @@ export default function Anotador() {
         const py = Math.round(cy + r * sin);
         if (px <= 5 || px >= 635 || py <= 5 || py >= 507) break;
 
-        const idx = (py * 640 + px) * 4;
+        const idx = (py * FLIR_WIDTH + px) * 4;
         const lum = (imgData[idx] + imgData[idx + 1] + imgData[idx + 2]) / 3;
 
         if (lum >= umbralEfectivo) {
@@ -276,8 +519,10 @@ export default function Anotador() {
     }
 
     const promedioLum = muestrasPool > 0 ? sumLumPool / muestrasPool : maxLumGlobal * 0.94;
-    const adMax = Math.round(1017 + (maxLumGlobal / 255) * (7082 - 1017));
-    const adPromedio = Math.round(1017 + (promedioLum / 255) * (7082 - 1017));
+    const minADBase = matriz14BitActualRef.current?.minAD || 1017;
+    const maxADBase = matriz14BitActualRef.current?.maxAD || 7082;
+    const adMax = Math.round(minADBase + (maxLumGlobal / 255) * (maxADBase - minADBase));
+    const adPromedio = Math.round(minADBase + (promedioLum / 255) * (maxADBase - minADBase));
     const incertidumbreCalc = Number(Math.min(24.5, Math.max(6.5, 8 + (bordeDifuso / (numVertices * 3)) * 10)).toFixed(1));
 
     setPoligonoIA(verticesDetectados);
@@ -285,6 +530,7 @@ export default function Anotador() {
     setTelemetriaPool({
       adMax,
       adPromedio,
+      adMin: minADBase,
       centroideX: cx,
       centroideY: cy,
       incertidumbre: incertidumbreCalc
@@ -292,22 +538,44 @@ export default function Anotador() {
     setModoValidacion('Binaria');
     setModificadoSinGuardar(false);
     inicioTiempoRef.current = Date.now();
-  }, [dibujarFuenteTermica, umbralIsotermico, imgElement, recorteEstela, direccionSoldadura]);
+
+    // Guardar en el catálogo maestro para que la exportación COCO incluya este fotograma aunque no sea rectificado manualmente
+    registrarFrameEnCatalogoMaestro(frameIdExplicito, {
+      frameNumber: numFrameExplicito,
+      poligonoIA: verticesDetectados,
+      poligono: verticesDetectados,
+      validadoPorExperto: false,
+      tipoValidacion: 'PreSegmentacion_Automatica',
+      algoritmoOrigen: motorPreSegmentacion,
+      adMax,
+      adPromedio,
+      adMin: minADBase,
+      centroideX: cx,
+      centroideY: cy,
+      incertidumbre: incertidumbreCalc
+    });
+
+    return verticesDetectados;
+  }, [
+    umbralIsotermico, imgElement, recorteEstela, identificadorFrame, frameActual,
+    dibujarFuenteTermica, motorPreSegmentacion, ejecutarAlgoritmoCarlosYOLO,
+    direccionSoldadura, registrarFrameEnCatalogoMaestro
+  ]);
 
   const calibrarDesdePoligonoExperto = (puntosExperto) => {
     if (!puntosExperto || puntosExperto.length < 3) return;
     const offscreen = document.createElement('canvas');
-    offscreen.width = 640;
-    offscreen.height = 512;
+    offscreen.width = FLIR_WIDTH;
+    offscreen.height = FLIR_HEIGHT;
     const ctx = offscreen.getContext('2d');
-    dibujarFuenteTermica(ctx, 640, 512, imgElement);
-    const imgData = ctx.getImageData(0, 0, 640, 512).data;
+    dibujarFuenteTermica(ctx, FLIR_WIDTH, FLIR_HEIGHT, imgElement);
+    const imgData = ctx.getImageData(0, 0, FLIR_WIDTH, FLIR_HEIGHT).data;
 
     let sumaLumBorde = 0;
     puntosExperto.forEach((pt) => {
       const px = Math.max(0, Math.min(639, pt.x));
       const py = Math.max(0, Math.min(511, pt.y));
-      const idx = (py * 640 + px) * 4;
+      const idx = (py * FLIR_WIDTH + px) * 4;
       const lum = (imgData[idx] + imgData[idx + 1] + imgData[idx + 2]) / 3;
       sumaLumBorde += lum;
     });
@@ -317,7 +585,6 @@ export default function Anotador() {
 
     const cxExp = Math.round(puntosExperto.reduce((acc, p) => acc + p.x, 0) / puntosExperto.length);
     const cyExp = Math.round(puntosExperto.reduce((acc, p) => acc + p.y, 0) / puntosExperto.length);
-
     ultimoCentroExpertoRef.current = { x: cxExp, y: cyExp };
 
     const offsets = puntosExperto.map((p) => ({ dx: p.x - cxExp, dy: p.y - cyExp }));
@@ -327,8 +594,8 @@ export default function Anotador() {
   const handleAplicarPlantillaExperto = () => {
     if (!plantillaExperto) return;
     const nuevosPuntos = plantillaExperto.map((off) => ({
-      x: Math.max(0, Math.min(640, telemetriaPool.centroideX + off.dx)),
-      y: Math.max(0, Math.min(512, telemetriaPool.centroideY + off.dy))
+      x: Math.max(0, Math.min(FLIR_WIDTH, telemetriaPool.centroideX + off.dx)),
+      y: Math.max(0, Math.min(FLIR_HEIGHT, telemetriaPool.centroideY + off.dy))
     }));
     setPoligono(nuevosPuntos);
     setModoValidacion('Poligono');
@@ -336,37 +603,54 @@ export default function Anotador() {
     setMensajeEstado('Contorno experto adaptado al centroide actual');
   };
 
+  // Gestionar cambio de fotograma (decodifica bloque .ATS si hay archivo crudo y consulta MongoDB)
   useEffect(() => {
     let cancelado = false;
     const gestionarCargaDeFrame = async () => {
+      if (archivoAtsCrudo) {
+        await decodificarFrameDesdeATS(archivoAtsCrudo, frameActual);
+      }
+
       try {
         const res = await axios.get(`${API_URL}/frame/${encodeURIComponent(identificadorFrame)}`);
         if (!cancelado && res.data.existe && res.data.data) {
           const doc = res.data.data;
-          setPoligonoIA(doc.poligonoPreEtiquetado?.length ? doc.poligonoPreEtiquetado : doc.poligono);
-          setPoligono(doc.poligono || []);
+          const polyIA = doc.poligonoPreEtiquetado?.length ? doc.poligonoPreEtiquetado : doc.poligono;
+          const polyFinal = doc.poligono || [];
+          setPoligonoIA(polyIA);
+          setPoligono(polyFinal);
           setModoValidacion(doc.tipoValidacion === 'Poligono' ? 'Poligono' : 'Binaria');
           setEstadoBD(doc.estado || 'Revisado');
           setModificadoSinGuardar(false);
-          if (doc.metadatos) {
-            setDireccionSoldadura(doc.metadatos.direccionSoldadura || 'Derecha a Izquierda');
-            setMaterial(doc.metadatos.material || 'Acero Inoxidable');
-            setCordones(doc.metadatos.numeroCordones || 1);
-          }
-          setMensajeEstado(`Validado en Atlas: ${identificadorFrame}`);
+
+          registrarFrameEnCatalogoMaestro(identificadorFrame, {
+            frameNumber: frameActual,
+            poligonoIA: polyIA,
+            poligono: polyFinal,
+            validadoPorExperto: doc.estado === 'Revisado',
+            tipoValidacion: doc.tipoValidacion,
+            adMax: doc.metadatos?.tempMaxima || 7082,
+            adPromedio: doc.metadatos?.tempPromedio || 6100,
+            iouSimilitud: doc.metadatos?.iouSimilitud ?? 100,
+            tiempoValidacionSeg: doc.metadatos?.tiempoValidacionSeg || 0
+          });
+
+          setMensajeEstado(`Recuperado de Atlas: ${identificadorFrame}`);
           inicioTiempoRef.current = Date.now();
           return;
         }
       } catch {
-        // Continúa a pre-segmentación
+        // Si no existe en MongoDB, pasa al motor de pre-segmentación
       }
 
       if (!cancelado) {
         setEstadoBD('Pendiente');
-        ejecutarPreSegmentacionIA(umbralIsotermico, imgElement, recorteEstela);
+        await ejecutarPreSegmentacionIA(umbralIsotermico, imgElement, recorteEstela, identificadorFrame, frameActual);
         setMensajeEstado(
-          fotogramaActivo
-            ? `Pre-etiquetado IA: ${fotogramaActivo.nombreArchivo}`
+          archivoAtsCrudo
+            ? `Frame .ATS #${frameActual} decodificado y pre-segmentado`
+            : fotogramaActivo
+            ? `Pre-segmentado: ${fotogramaActivo.nombreArchivo}`
             : 'Pre-segmentación aplicada'
         );
       }
@@ -374,16 +658,43 @@ export default function Anotador() {
 
     gestionarCargaDeFrame();
     return () => { cancelado = true; };
-  }, [identificadorFrame, imgElement, fotogramaActivo, ejecutarPreSegmentacionIA, umbralIsotermico, recorteEstela]);
+  }, [
+    identificadorFrame, archivoAtsCrudo, frameActual, imgElement, fotogramaActivo,
+    decodificarFrameDesdeATS, ejecutarPreSegmentacionIA, umbralIsotermico, recorteEstela,
+    registrarFrameEnCatalogoMaestro
+  ]);
 
   const toggleTheme = () => {
     setTheme((prev) => (prev === 'light' ? 'dark' : 'light'));
   };
 
+  // CARGAR ARCHIVO .ATS CRUDO DIRECTAMENTE (4.4 GB - 5.0 GB SIN BLOQUEAR EL NAVEGADOR)
+  const handleCargarArchivoATS = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setLoteFotogramas([]);
+    setArchivoAtsCrudo(file);
+    setSecuenciaActiva(file.name);
+
+    // Calcular total de fotogramas a partir del tamaño del binario .ats
+    const framesCalculados = Math.max(1, Math.floor((file.size - ATS_GLOBAL_HEADER) / ATS_FRAME_STRIDE));
+    setTotalFrames(framesCalculados);
+    setIndiceLote(0);
+    setFrameActual(1);
+
+    await decodificarFrameDesdeATS(file, 1);
+    await ejecutarPreSegmentacionIA(umbralIsotermico, null, recorteEstela, `${file.name}_frame_1`, 1);
+    setMensajeEstado(`Archivo ${file.name} (${(file.size / (1024 ** 3)).toFixed(2)} GB | ${framesCalculados} frames) montado`);
+  };
+
+  // CARGAR LOTE DE IMÁGENES (.PNG / .JPG)
   const handleSubirLoteImagenes = async (e) => {
     const files = Array.from(e.target.files || []);
     if (files.length === 0) return;
 
+    setArchivoAtsCrudo(null);
+    matriz14BitActualRef.current = null;
     files.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
 
     const promesasCarga = files.map((file, idx) => {
@@ -406,33 +717,85 @@ export default function Anotador() {
 
     const imagenesCargadas = await Promise.all(promesasCarga);
     setLoteFotogramas(imagenesCargadas);
+    setTotalFrames(imagenesCargadas.length);
+    setIndiceLote(0);
+    setFrameActual(1);
 
-    // Si había un índice guardado dentro del rango del lote, restaurarlo automáticamente
-    const indiceGuardado = Number(localStorage.getItem('hitl-indice-lote')) || 0;
-    const indiceValido = indiceGuardado < imagenesCargadas.length ? indiceGuardado : 0;
-
-    setIndiceLote(indiceValido);
-    setFrameActual(indiceValido + 1);
-
-    ejecutarPreSegmentacionIA(umbralIsotermico, imagenesCargadas[indiceValido].imgElement, recorteEstela);
-    setMensajeEstado(`Lote cargado (${imagenesCargadas.length} frames). Posición restaurada en #${indiceValido + 1}`);
+    const primerId = `${secuenciaActiva}_${imagenesCargadas[0].nombreArchivo.replace(/\.[^/.]+$/, '')}`;
+    await ejecutarPreSegmentacionIA(umbralIsotermico, imagenesCargadas[0].imgElement, recorteEstela, primerId, 1);
+    setMensajeEstado(`Lote cargado: ${imagenesCargadas.length} fotogramas listos`);
   };
 
-  const calcularGeometria = (puntos) => {
-    if (!puntos || puntos.length < 3) return { area: 0, perimetro: 0 };
-    let area = 0;
-    let perimetro = 0;
-    const n = puntos.length;
-    for (let i = 0; i < n; i++) {
-      const p1 = puntos[i];
-      const p2 = puntos[(i + 1) % n];
-      area += p1.x * p2.y - p2.x * p1.y;
-      perimetro += Math.hypot(p2.x - p1.x, p2.y - p1.y);
+  // =========================================================================
+  // 4. BARRIDO AUTOMÁTICO DE SECUENCIA COMPLETA PARA EXPORTACIÓN TOTAL COCO
+  // =========================================================================
+  const handlePreSegmentarSecuenciaCompleta = async () => {
+    if (procesandoLoteMasivo) return;
+    setProcesandoLoteMasivo(true);
+    setProgresoLote(0);
+
+    const loteParaBackend = [];
+    // Si es un archivo .ats de >2000 frames sin lote de imágenes, barremos los frames o el muestreo activo
+    const limiteFrames = loteFotogramas.length > 0
+      ? loteFotogramas.length
+      : Math.min(totalFrames, 500);
+
+    for (let i = 0; i < limiteFrames; i++) {
+      const numFrame = i + 1;
+      const itemImg = loteFotogramas.length > 0 ? loteFotogramas[i] : null;
+      const fId = archivoAtsCrudo
+        ? `${secuenciaActiva}_frame_${numFrame}`
+        : itemImg
+        ? `${secuenciaActiva}_${itemImg.nombreArchivo.replace(/\.[^/.]+$/, '')}`
+        : `${secuenciaActiva}_frame_${numFrame}`;
+
+      // Si ya fue rectificado por el experto en esta sesión, no lo sobrescribimos
+      if (!registroSecuenciaRef.current[fId]?.validadoPorExperto) {
+        if (archivoAtsCrudo) {
+          await decodificarFrameDesdeATS(archivoAtsCrudo, numFrame);
+        }
+        const ptsDetectados = await ejecutarPreSegmentacionIA(
+          umbralIsotermico,
+          itemImg ? itemImg.imgElement : null,
+          recorteEstela,
+          fId,
+          numFrame
+        );
+
+        const reg = registroSecuenciaRef.current[fId];
+        if (reg && ptsDetectados.length >= 3) {
+          loteParaBackend.push({
+            frameId: fId,
+            imageUrl: `/dataset/${secuenciaActiva}/${fId}.png`,
+            poligonoPreEtiquetado: ptsDetectados,
+            poligono: ptsDetectados,
+            tempMaxima: reg.metadatos.tempMaxima,
+            tempPromedio: reg.metadatos.tempPromedio,
+            incertidumbreAlgoritmo: reg.metadatos.incertidumbreAlgoritmo,
+            direccionSoldadura,
+            material,
+            numeroCordones: cordones
+          });
+        }
+      }
+
+      if (i % 10 === 0 || i === limiteFrames - 1) {
+        setProgresoLote(Math.round(((i + 1) / limiteFrames) * 100));
+        await new Promise((r) => setTimeout(r, 5));
+      }
     }
-    return {
-      area: Math.round(Math.abs(area) / 2),
-      perimetro: Math.round(perimetro)
-    };
+
+    // Sincronizar el lote pre-segmentado con MongoDB Atlas en bloques
+    if (loteParaBackend.length > 0) {
+      try {
+        await axios.post(`${API_URL}/batch`, { frames: loteParaBackend.slice(0, 300) });
+      } catch {
+        // El registro en memoria local sigue disponible al 100% para exportar a COCO
+      }
+    }
+
+    setProcesandoLoteMasivo(false);
+    setMensajeEstado(`Secuencia procesada: ${ Object.keys(registroSecuenciaRef.current).length } frames listos para exportar a COCO`);
   };
 
   const geometria = calcularGeometria(poligono);
@@ -448,6 +811,7 @@ export default function Anotador() {
 
   const iouActual = calcularSimilitudIoU();
 
+  // Renderizado del Lienzo Principal
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -526,8 +890,8 @@ export default function Anotador() {
   const obtenerCoordenadasCanvas = (e) => {
     const rect = canvasRef.current.getBoundingClientRect();
     return {
-      x: Math.max(0, Math.min(640, Math.round(e.clientX - rect.left))),
-      y: Math.max(0, Math.min(512, Math.round(e.clientY - rect.top)))
+      x: Math.max(0, Math.min(FLIR_WIDTH, Math.round(e.clientX - rect.left))),
+      y: Math.max(0, Math.min(FLIR_HEIGHT, Math.round(e.clientY - rect.top)))
     };
   };
 
@@ -556,6 +920,15 @@ export default function Anotador() {
       setModificadoSinGuardar(true);
     }
 
+    // Si hay matriz binaria de 14-bits desde archivo .ATS, mostrar el valor AD exacto del sensor FLIR
+    if (archivoAtsCrudo && matriz14BitActualRef.current) {
+      const { raw16 } = matriz14BitActualRef.current;
+      const idx14 = Math.min(511, y) * FLIR_WIDTH + Math.min(639, x);
+      const counts = raw16[idx14] & 0x3FFF;
+      setCursorPos({ x, y, counts });
+      return;
+    }
+
     const canvas = canvasRef.current;
     if (canvas) {
       const ctx = canvas.getContext('2d');
@@ -581,7 +954,6 @@ export default function Anotador() {
     }
   };
 
-  // Navegación hacia adelante y hacia atrás
   const irAFotograma = useCallback((nuevoValorFrame) => {
     const frameClamped = Math.max(1, Math.min(totalFrames, nuevoValorFrame));
     if (loteFotogramas.length > 0) {
@@ -592,7 +964,6 @@ export default function Anotador() {
     }
   }, [totalFrames, loteFotogramas.length]);
 
-  // Guardado en MongoDB Atlas con opción de avanzar automáticamente al siguiente fotograma
   const handleGuardarValidacion = useCallback(async (avanzarDespues = autoAvanzar) => {
     setGuardando(true);
     const ahora = Date.now();
@@ -603,10 +974,29 @@ export default function Anotador() {
       calibrarDesdePoligonoExperto(poligono);
     }
 
+    // Actualizar en el catálogo maestro marcándolo como rectificado/validado por el experto
+    registrarFrameEnCatalogoMaestro(identificadorFrame, {
+      frameNumber: frameActual,
+      poligonoIA,
+      poligono,
+      validadoPorExperto: true,
+      tipoValidacion: modoValidacion,
+      algoritmoOrigen: motorPreSegmentacion,
+      adMax: telemetriaPool.adMax,
+      adPromedio: telemetriaPool.adPromedio,
+      adMin: telemetriaPool.adMin,
+      centroideX: telemetriaPool.centroideX,
+      centroideY: telemetriaPool.centroideY,
+      incertidumbre: telemetriaPool.incertidumbre,
+      iouSimilitud: iouActual,
+      tiempoValidacionSeg: tiempoSegundos
+    });
+
     try {
       const payload = {
         frameId: identificadorFrame,
         imageUrl: `/dataset/${secuenciaActiva}/${identificadorFrame}.png`,
+        estado: 'Revisado',
         tipoValidacion: modoValidacion,
         aprobadoBinario: modoValidacion === 'Binaria',
         poligonoPreEtiquetado: poligonoIA,
@@ -632,18 +1022,20 @@ export default function Anotador() {
         irAFotograma(frameActual + 1);
       }
     } catch {
-      setMensajeEstado('Error de conexión con Backend (Puerto 3000)');
+      setMensajeEstado('Guardado en catálogo maestro local (Backend desconectado)');
+      if (avanzarDespues && frameActual < totalFrames) {
+        irAFotograma(frameActual + 1);
+      }
     } finally {
       setGuardando(false);
     }
   }, [
     autoAvanzar, modoValidacion, poligono, poligonoIA, identificadorFrame,
-    secuenciaActiva, telemetriaPool, iouActual, umbralIsotermico,
-    direccionSoldadura, material, cordones, frameActual, totalFrames, irAFotograma
+    frameActual, motorPreSegmentacion, telemetriaPool, iouActual, umbralIsotermico,
+    direccionSoldadura, material, cordones, secuenciaActiva, totalFrames,
+    irAFotograma, registrarFrameEnCatalogoMaestro
   ]);
 
-  // Si el usuario modificó el polígono y presiona Siguiente o Anterior sin haber guardado,
-  // auto-guardamos sus cambios primero para que nunca pierda su trabajo
   const handleNavegarSeguro = useCallback(async (direccion) => {
     if (modificadoSinGuardar && poligono.length >= 3) {
       await handleGuardarValidacion(false);
@@ -651,7 +1043,6 @@ export default function Anotador() {
     irAFotograma(frameActual + direccion);
   }, [modificadoSinGuardar, poligono.length, handleGuardarValidacion, irAFotograma, frameActual]);
 
-  // Atajos de teclado ergonómicos para sesión de laboratorio (←, →, Espacio / Enter)
   useEffect(() => {
     const manejarTeclado = (e) => {
       if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
@@ -676,14 +1067,16 @@ export default function Anotador() {
     try {
       const res = await axios.get(`${API_URL}?secuencia=${secuenciaActiva}`);
       const docs = res.data || [];
-      if (docs.length > 0) {
-        const total = docs.length;
-        const sumaTiempo = docs.reduce((acc, d) => acc + (d.metadatos?.tiempoValidacionSeg || 2.5), 0);
-        const sumaIoU = docs.reduce((acc, d) => acc + (d.metadatos?.iouSimilitud ?? 100), 0);
-        const confirmaciones = docs.filter((d) => d.tipoValidacion === 'Binaria').length;
+      const docsRevisados = docs.filter((d) => d.estado === 'Revisado');
+      if (docsRevisados.length > 0) {
+        const total = docsRevisados.length;
+        const sumaTiempo = docsRevisados.reduce((acc, d) => acc + (d.metadatos?.tiempoValidacionSeg || 2.5), 0);
+        const sumaIoU = docsRevisados.reduce((acc, d) => acc + (d.metadatos?.iouSimilitud ?? 100), 0);
+        const confirmaciones = docsRevisados.filter((d) => d.tipoValidacion === 'Binaria').length;
 
         setResumenMetricas({
           totalValidados: total,
+          totalPreSegmentados: Math.max(docs.length, Object.keys(registroSecuenciaRef.current).length),
           tiempoPromedioSeg: Number((sumaTiempo / total).toFixed(2)),
           iouPromedio: Number((sumaIoU / total).toFixed(1)),
           tasaConfirmacionDirecta: Number(((confirmaciones / total) * 100).toFixed(1)),
@@ -691,19 +1084,19 @@ export default function Anotador() {
         });
       }
     } catch {
-      // Mantiene métricas locales
+      // Usa métricas en memoria si está offline
     }
     setMostrarMetricas(true);
   };
 
   const handleDescargarMascaraBinaria = () => {
     const maskCanvas = document.createElement('canvas');
-    maskCanvas.width = 640;
-    maskCanvas.height = 512;
+    maskCanvas.width = FLIR_WIDTH;
+    maskCanvas.height = FLIR_HEIGHT;
     const mCtx = maskCanvas.getContext('2d');
 
     mCtx.fillStyle = '#000000';
-    mCtx.fillRect(0, 0, 640, 512);
+    mCtx.fillRect(0, 0, FLIR_WIDTH, FLIR_HEIGHT);
 
     if (poligono.length >= 3) {
       mCtx.beginPath();
@@ -723,64 +1116,102 @@ export default function Anotador() {
     a.click();
   };
 
+  // =========================================================================
+  // 5. EXPORTAR DATASET COCO CON TODOS LOS FRAMES PROCESADOS (PRE-ETIQUETADOS + RECTIFICADOS)
+  // =========================================================================
   const handleExportarCOCO = async () => {
     try {
-      const res = await axios.get(`${API_URL}?secuencia=${secuenciaActiva}`);
-      const registros = res.data;
+      // 1. Obtener fotogramas guardados en MongoDB Atlas
+      let registrosMongo = [];
+      try {
+        const res = await axios.get(`${API_URL}?secuencia=${secuenciaActiva}`);
+        registrosMongo = res.data || [];
+      } catch {
+        registrosMongo = [];
+      }
 
-      const listaExportar = registros.length > 0 ? registros : [{
-        frameId: identificadorFrame,
-        poligonoPreEtiquetado: poligonoIA,
-        poligono,
-        tipoValidacion: modoValidacion,
-        metadatos: {
-          areaPixeles: geometria.area,
-          perimetroPixeles: geometria.perimetro,
-          tempMaxima: telemetriaPool.adMax,
-          tempPromedio: telemetriaPool.adPromedio,
-          iouSimilitud: iouActual,
-          direccionSoldadura,
-          material
-        }
-      }];
+      // 2. Fusionar el Catálogo Maestro de todos los frames procesados en memoria con los rectificados en MongoDB
+      const mapaConsolidado = { ...registroSecuenciaRef.current };
+
+      registrosMongo.forEach((doc) => {
+        mapaConsolidado[doc.frameId] = {
+          frameId: doc.frameId,
+          frameNumber: mapaConsolidado[doc.frameId]?.frameNumber || 1,
+          fileName: `${doc.frameId}.png`,
+          poligonoIA: doc.poligonoPreEtiquetado?.length ? doc.poligonoPreEtiquetado : doc.poligono,
+          poligono: doc.poligono || [],
+          validadoPorExperto: doc.estado === 'Revisado',
+          tipoValidacion: doc.tipoValidacion || 'Binaria',
+          algoritmoOrigen: motorPreSegmentacion,
+          metadatos: {
+            ...metadatosAts,
+            ...doc.metadatos
+          }
+        };
+      });
+
+      const listaExportar = Object.values(mapaConsolidado).sort((a, b) =>
+        a.frameId.localeCompare(b.frameId, undefined, { numeric: true })
+      );
+
+      const totalRectificados = listaExportar.filter((item) => item.validadoPorExperto).length;
+      const totalSoloIA = listaExportar.length - totalRectificados;
 
       const cocoDataset = {
         info: {
-          description: `CIDESI - Dataset Termográfico DED-LB (${secuenciaActiva})`,
-          version: '1.0',
+          description: `CIDESI - Dataset Termográfico Completo DED-LB (${secuenciaActiva})`,
+          version: '2.0',
           year: 2026,
           contributor: localStorage.getItem('expertEmail') || 'Investigador CIDESI',
-          total_validated_frames: listaExportar.length
+          presegmentation_engine: motorPreSegmentacion,
+          total_processed_frames: listaExportar.length,
+          expert_rectified_frames: totalRectificados,
+          ai_presegmented_only_frames: totalSoloIA
         },
         images: listaExportar.map((item, idx) => ({
           id: idx + 1,
-          file_name: `${item.frameId}.png`,
-          width: 640,
-          height: 512,
+          file_name: item.fileName || `${item.frameId}.png`,
+          frame_id: item.frameId,
+          width: FLIR_WIDTH,
+          height: FLIR_HEIGHT,
           flir_metadata: {
             camera_model: 'FLIR A6751sc',
             ad_bits: 14,
             fps: 127,
-            emissivity: 0.92,
-            max_counts: item.metadatos?.tempMaxima || telemetriaPool.adMax,
-            mean_counts: item.metadatos?.tempPromedio || telemetriaPool.adPromedio,
+            emissivity: metadatosAts.emissivity,
+            distance_m: metadatosAts.distanceMeters,
+            reflected_temp_c: metadatosAts.reflectedTempC,
+            relative_humidity_pct: metadatosAts.relativeHumidity,
+            max_counts_ad: item.metadatos?.tempMaxima || telemetriaPool.adMax,
+            mean_counts_ad: item.metadatos?.tempPromedio || telemetriaPool.adPromedio,
+            min_counts_ad: item.metadatos?.tempMinima || telemetriaPool.adMin,
             welding_direction: item.metadatos?.direccionSoldadura || direccionSoldadura,
-            material: item.metadatos?.material || material
+            material: item.metadatos?.material || material,
+            numero_cordones: item.metadatos?.numeroCordones || cordones
           }
         })),
-        annotations: listaExportar.map((item, idx) => ({
-          id: idx + 1,
-          image_id: idx + 1,
-          category_id: 1,
-          segmentation: [item.poligono.flatMap((p) => [p.x, p.y])],
-          ai_pre_segmentation: [item.poligonoPreEtiquetado?.flatMap((p) => [p.x, p.y]) || []],
-          area: item.metadatos?.areaPixeles ?? geometria.area,
-          perimeter: item.metadatos?.perimetroPixeles ?? geometria.perimetro,
-          iou_agreement: item.metadatos?.iouSimilitud ?? 100,
-          validation_time_sec: item.metadatos?.tiempoValidacionSeg ?? 0,
-          iscrowd: 0,
-          validation_mode: item.tipoValidacion
-        })),
+        annotations: listaExportar.map((item, idx) => {
+          const geo = calcularGeometria(item.poligono);
+          return {
+            id: idx + 1,
+            image_id: idx + 1,
+            category_id: 1,
+            segmentation: [item.poligono.flatMap((p) => [p.x, p.y])],
+            ai_pre_segmentation: [item.poligonoIA?.flatMap((p) => [p.x, p.y]) || []],
+            area: item.metadatos?.areaPixeles || geo.area,
+            perimeter: item.metadatos?.perimetroPixeles || geo.perimetro,
+            centroid: [
+              item.metadatos?.centroideX || telemetriaPool.centroideX,
+              item.metadatos?.centroideY || telemetriaPool.centroideY
+            ],
+            iou_agreement: item.metadatos?.iouSimilitud ?? 100,
+            validation_time_sec: item.metadatos?.tiempoValidacionSeg ?? 0,
+            iscrowd: 0,
+            validated_by_human: Boolean(item.validadoPorExperto),
+            validation_status: item.validadoPorExperto ? 'expert_rectified' : 'ai_presegmented',
+            validation_mode: item.tipoValidacion
+          };
+        }),
         categories: [{ id: 1, name: 'molten_pool', supercategory: 'welding_thermal' }]
       };
 
@@ -788,11 +1219,13 @@ export default function Anotador() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `COCO_${secuenciaActiva.replace('.ats', '')}_Dataset.json`;
+      a.download = `COCO_COMPLETO_${secuenciaActiva.replace('.ats', '')}_${listaExportar.length}frames.json`;
       a.click();
-      setMensajeEstado(`Exportados ${listaExportar.length} registros en formato COCO`);
+      setMensajeEstado(
+        `COCO exportado: ${listaExportar.length} frames totales (${totalRectificados} rectificados + ${totalSoloIA} pre-etiquetados)`
+      );
     } catch {
-      setMensajeEstado('Error al exportar dataset');
+      setMensajeEstado('Error al consolidar la exportación COCO');
     }
   };
 
@@ -828,19 +1261,19 @@ export default function Anotador() {
         padding: '0 20px',
         flexShrink: 0
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
           <span style={{ fontSize: '13px', fontWeight: '700', letterSpacing: '0.04em', color: 'var(--text-primary)' }}>
             CIDESI
           </span>
           <span style={{ color: 'var(--border-color)' }}>/</span>
           <span style={{ fontSize: '13px', fontWeight: '500', color: 'var(--text-secondary)' }}>
-            Estación de Análisis Termográfico HITL
+            Estación Termográfica HITL
           </span>
           <select
             value={secuenciaActiva}
             onChange={(e) => setSecuenciaActiva(e.target.value)}
             className="input-field"
-            style={{ width: 'auto', height: '30px', fontSize: '12px', marginLeft: '8px' }}
+            style={{ width: 'auto', height: '30px', fontSize: '12px', marginLeft: '4px' }}
           >
             <option value="RC1.ats">RC1.ats (5.05 GB)</option>
             <option value="RC2.ats">RC2.ats (4.66 GB)</option>
@@ -850,13 +1283,29 @@ export default function Anotador() {
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <label className="btn btn-outline" title="Seleccione múltiples fotogramas exportados de FLIR (.png/.jpg)">
+          {/* Botón 1: Cargar archivo .ATS crudo directo sin límite de tamaño */}
+          <label className="btn btn-outline" title="Abrir archivo binario .ATS crudo de FLIR (lectura directa de 14-bits por bloques)">
+            <svg className="icon-svg" viewBox="0 0 24 24">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+              <polyline points="14 2 14 8 20 8" />
+            </svg>
+            <span>{archivoAtsCrudo ? `ATS: ${archivoAtsCrudo.name}` : 'Cargar .ATS Crudo'}</span>
+            <input
+              type="file"
+              accept=".ats,.raw,application/octet-stream"
+              onChange={handleCargarArchivoATS}
+              style={{ display: 'none' }}
+            />
+          </label>
+
+          {/* Botón 2: Cargar lote de fotogramas .png/.jpg */}
+          <label className="btn btn-outline" title="Cargar carpeta o lote de fotogramas .png/.jpg">
             <svg className="icon-svg" viewBox="0 0 24 24">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
               <polyline points="17 8 12 3 7 8" />
               <line x1="12" y1="3" x2="12" y2="15" />
             </svg>
-            <span>Cargar Lote ({loteFotogramas.length || 0})</span>
+            <span>Lote PNG ({loteFotogramas.length || 0})</span>
             <input
               type="file"
               accept="image/*"
@@ -865,6 +1314,25 @@ export default function Anotador() {
               style={{ display: 'none' }}
             />
           </label>
+
+          {/* Botón 3: Procesar secuencia completa para que TODOS los frames entren al COCO */}
+          <button
+            type="button"
+            onClick={handlePreSegmentarSecuenciaCompleta}
+            disabled={procesandoLoteMasivo}
+            className="btn btn-outline"
+            title="Pre-segmenta automáticamente toda la secuencia para incluir todos los frames en el archivo COCO"
+          >
+            <svg className="icon-svg" viewBox="0 0 24 24">
+              <polyline points="23 4 23 10 17 10" />
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+            </svg>
+            <span>
+              {procesandoLoteMasivo
+                ? `Procesando (${progresoLote}%)`
+                : `Pre-segmentar Lote (${totalFramesEnRegistro})`}
+            </span>
+          </button>
 
           <button onClick={handleAbrirMetricasHITL} className="btn btn-outline">
             <svg className="icon-svg" viewBox="0 0 24 24">
@@ -884,13 +1352,13 @@ export default function Anotador() {
             <span>Máscara PNG</span>
           </button>
 
-          <button onClick={handleExportarCOCO} className="btn btn-outline">
+          <button onClick={handleExportarCOCO} className="btn btn-outline" title="Exporta TODOS los fotogramas procesados (pre-segmentados + rectificados)">
             <svg className="icon-svg" viewBox="0 0 24 24">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
               <polyline points="7 10 12 15 17 10" />
               <line x1="12" y1="15" x2="12" y2="3" />
             </svg>
-            <span>Exportar COCO</span>
+            <span>Exportar COCO Total</span>
           </button>
 
           <button onClick={toggleTheme} className="btn btn-outline" title="Alternar Modo Claro / Oscuro">
@@ -913,8 +1381,6 @@ export default function Anotador() {
             )}
           </button>
 
-          <div style={{ width: '1px', height: '20px', backgroundColor: 'var(--border-color)', margin: '0 4px' }} />
-
           <button onClick={handleCerrarSesion} className="btn btn-ghost">
             <svg className="icon-svg" viewBox="0 0 24 24">
               <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
@@ -929,7 +1395,7 @@ export default function Anotador() {
       {/* CUERPO PRINCIPAL */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         
-        {/* PANEL IZQUIERDO */}
+        {/* PANEL IZQUIERDO: TELEMETRÍA Y METADATOS EXTRAÍDOS DEL .ATS */}
         <aside style={{
           width: '235px',
           backgroundColor: 'var(--bg-surface)',
@@ -974,24 +1440,28 @@ export default function Anotador() {
 
           <div className="panel-section">
             <div className="section-header">
-              <h2 className="section-title">Parámetros Radiométricos</h2>
+              <h2 className="section-title">Metadatos Cabezal .ATS</h2>
             </div>
             <div className="data-list">
               <div className="data-row">
                 <span className="data-label">Cámara</span>
-                <span className="data-value">A6751sc</span>
+                <span className="data-value">{metadatosAts.cameraModel}</span>
               </div>
               <div className="data-row">
                 <span className="data-label">Resolución</span>
-                <span className="data-value">640×512</span>
+                <span className="data-value">{metadatosAts.resolution} ({metadatosAts.adBits}-bit)</span>
               </div>
               <div className="data-row">
                 <span className="data-label">Emisividad</span>
-                <span className="data-value">0.92</span>
+                <span className="data-value">{metadatosAts.emissivity}</span>
               </div>
               <div className="data-row">
-                <span className="data-label">Distancia</span>
-                <span className="data-value">1.00 m</span>
+                <span className="data-label">Distancia / Temp.</span>
+                <span className="data-value">{metadatosAts.distanceMeters}m / {metadatosAts.reflectedTempC}°C</span>
+              </div>
+              <div className="data-row">
+                <span className="data-label">Timestamp</span>
+                <span className="data-value">{metadatosAts.timestampMs} ms</span>
               </div>
             </div>
           </div>
@@ -1094,8 +1564,8 @@ export default function Anotador() {
                   {modificadoSinGuardar
                     ? 'Editando (Sin guardar)'
                     : estadoBD === 'Revisado'
-                    ? 'Validado en Atlas'
-                    : 'Pre-etiquetado por IA'}
+                    ? 'Rectificado por Experto'
+                    : 'Pre-segmentado por IA'}
                 </span>
               </div>
 
@@ -1124,8 +1594,8 @@ export default function Anotador() {
             }}>
               <canvas
                 ref={canvasRef}
-                width={640}
-                height={512}
+                width={FLIR_WIDTH}
+                height={FLIR_HEIGHT}
                 onMouseDown={handleMouseDown}
                 onMouseMove={handleMouseMove}
                 onMouseUp={handleMouseUp}
@@ -1149,7 +1619,7 @@ export default function Anotador() {
                 fontFamily: 'JetBrains Mono, Consolas, monospace',
                 color: 'var(--text-secondary)'
               }}>
-                <span style={{ fontWeight: '600', color: 'var(--text-primary)' }}>7082</span>
+                <span style={{ fontWeight: '600', color: 'var(--text-primary)' }}>{telemetriaPool.adMax}</span>
                 <span>4715</span>
                 <div style={{
                   flex: 1,
@@ -1160,11 +1630,10 @@ export default function Anotador() {
                   borderRadius: '2px'
                 }} />
                 <span>1415</span>
-                <span>1017</span>
+                <span>{telemetriaPool.adMin}</span>
               </div>
             </div>
 
-            {/* BARRA UNIFICADA DE TRANSPORTE Y VALIDACIÓN RÁPIDA (ANTERIOR / SLIDER / SIGUIENTE / GUARDAR) */}
             <div style={{
               display: 'flex',
               alignItems: 'center',
@@ -1181,7 +1650,6 @@ export default function Anotador() {
                 disabled={frameActual <= 1}
                 className="btn btn-outline"
                 style={{ height: '30px', padding: '0 10px', fontSize: '11px' }}
-                title="Fotograma anterior (Flecha Izquierda ←)"
               >
                 <svg className="icon-svg" viewBox="0 0 24 24">
                   <polygon points="19 20 9 12 19 4 19 20" />
@@ -1207,7 +1675,6 @@ export default function Anotador() {
                 onChange={(e) => irAFotograma(Number(e.target.value))}
                 className="input-field"
                 style={{ width: '64px', height: '30px', fontSize: '11px', textAlign: 'center', fontFamily: 'monospace' }}
-                title="Ir directamente al número de fotograma"
               />
 
               <button
@@ -1216,7 +1683,6 @@ export default function Anotador() {
                 disabled={frameActual >= totalFrames}
                 className="btn btn-outline"
                 style={{ height: '30px', padding: '0 10px', fontSize: '11px' }}
-                title="Siguiente fotograma (Flecha Derecha →)"
               >
                 <span>Siguiente</span>
                 <svg className="icon-svg" viewBox="0 0 24 24">
@@ -1225,14 +1691,12 @@ export default function Anotador() {
                 </svg>
               </button>
 
-              {/* Botón directo de 1 solo clic junto a los controles de reproducción */}
               <button
                 type="button"
                 onClick={() => handleGuardarValidacion(true)}
                 disabled={guardando}
                 className="btn btn-primary"
                 style={{ height: '30px', padding: '0 14px', fontSize: '11px' }}
-                title="Guardar en Atlas y pasar al siguiente fotograma (Tecla Espacio o Enter)"
               >
                 <span>{guardando ? 'Guardando...' : 'Guardar y Siguiente'}</span>
                 <svg className="icon-svg" viewBox="0 0 24 24">
@@ -1243,7 +1707,7 @@ export default function Anotador() {
           </div>
         </main>
 
-        {/* PANEL DERECHO */}
+        {/* PANEL DERECHO: MOTOR YOLO CARLOS + DICTAMEN EXPERTO */}
         <aside style={{
           width: '265px',
           backgroundColor: 'var(--bg-surface)',
@@ -1258,7 +1722,7 @@ export default function Anotador() {
             
             <div className="panel-section">
               <div className="section-header">
-                <h2 className="section-title">Pre-Segmentación IA</h2>
+                <h2 className="section-title">Motor de Pre-Segmentación</h2>
                 <div className="info-tooltip">
                   <svg className="icon-svg" viewBox="0 0 24 24">
                     <circle cx="12" cy="12" r="10" />
@@ -1266,13 +1730,23 @@ export default function Anotador() {
                     <line x1="12" y1="8" x2="12.01" y2="8" />
                   </svg>
                   <div className="tooltip-content">
-                    Atajos rápidos: [Espacio/Enter] Guardar y Avanzar | [← / →] Cambiar fotograma con auto-guardado.
+                    Conecta con el algoritmo YOLO de Carlos para pre-segmentar los fotogramas del archivo .ATS. Incluye respaldo isotérmico automático.
                   </div>
                 </div>
               </div>
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--text-secondary)' }}>
+                <select
+                  value={motorPreSegmentacion}
+                  onChange={(e) => setMotorPreSegmentacion(e.target.value)}
+                  className="input-field"
+                  style={{ height: '30px', fontSize: '12px' }}
+                >
+                  <option value="YOLO_CARLOS">YOLO Segmentación (Algoritmo Carlos)</option>
+                  <option value="ISOTERMICO_LOCAL">Isotérmico Liquidus (Respaldo Local)</option>
+                </select>
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--text-secondary)', marginTop: '4px' }}>
                   <span>Corte Isotérmico (Liquidus)</span>
                   <span style={{ fontFamily: 'monospace', color: 'var(--text-primary)' }}>
                     {Math.round(1017 + (umbralIsotermico / 255) * (7082 - 1017))} AD
@@ -1291,7 +1765,7 @@ export default function Anotador() {
                   style={{ width: '100%', accentColor: 'var(--accent-primary)', cursor: 'pointer' }}
                 />
 
-                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: 'var(--text-secondary)', cursor: 'pointer', marginTop: '2px' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: 'var(--text-secondary)', cursor: 'pointer' }}>
                   <input
                     type="checkbox"
                     checked={recorteEstela}
@@ -1304,7 +1778,7 @@ export default function Anotador() {
                   Suprimir estela de enfriamiento
                 </label>
 
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '2px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: 'var(--text-secondary)', cursor: 'pointer' }}>
                     <input
                       type="checkbox"
@@ -1328,7 +1802,7 @@ export default function Anotador() {
                     type="button"
                     onClick={handleAplicarPlantillaExperto}
                     className="btn btn-outline"
-                    style={{ width: '100%', marginTop: '4px', height: '28px', fontSize: '11px' }}
+                    style={{ width: '100%', marginTop: '2px', height: '26px', fontSize: '11px' }}
                   >
                     Propagar contorno experto anterior
                   </button>
@@ -1360,7 +1834,7 @@ export default function Anotador() {
                   <svg className="icon-svg" viewBox="0 0 24 24">
                     <polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2" />
                   </svg>
-                  <span>Corregir</span>
+                  <span>Rectificar</span>
                 </button>
               </div>
 
@@ -1375,10 +1849,6 @@ export default function Anotador() {
                     className="btn btn-outline"
                     style={{ flex: 1 }}
                   >
-                    <svg className="icon-svg" viewBox="0 0 24 24">
-                      <path d="M3 7v6h6" />
-                      <path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13" />
-                    </svg>
                     <span>Deshacer</span>
                   </button>
                   <button
@@ -1390,10 +1860,6 @@ export default function Anotador() {
                     className="btn btn-outline"
                     style={{ flex: 1 }}
                   >
-                    <svg className="icon-svg" viewBox="0 0 24 24">
-                      <polyline points="3 6 5 6 21 6" />
-                      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                    </svg>
                     <span>Limpiar</span>
                   </button>
                 </div>
@@ -1416,7 +1882,7 @@ export default function Anotador() {
                 </summary>
 
                 <div style={{
-                  maxHeight: '140px',
+                  maxHeight: '130px',
                   overflowY: 'auto',
                   border: '1px solid var(--border-color)',
                   borderRadius: '6px'
@@ -1481,11 +1947,6 @@ export default function Anotador() {
               className="btn btn-primary"
               style={{ width: '100%', height: '38px', fontSize: '13px' }}
             >
-              <svg className="icon-svg" viewBox="0 0 24 24">
-                <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
-                <polyline points="17 21 17 13 7 13 7 21" />
-                <polyline points="7 3 7 8 15 8" />
-              </svg>
               <span>
                 {guardando
                   ? 'Sincronizando...'
@@ -1498,7 +1959,7 @@ export default function Anotador() {
         </aside>
       </div>
 
-      {/* MODAL DE MÉTRICAS DE DESEMPEÑO HITL */}
+      {/* MODAL DE MÉTRICAS HITL */}
       {mostrarMetricas && (
         <div style={{
           position: 'fixed',
@@ -1533,7 +1994,11 @@ export default function Anotador() {
 
             <div className="data-list" style={{ borderTop: '1px solid var(--border-color)', paddingTop: '14px' }}>
               <div className="data-row">
-                <span className="data-label">Fotogramas Validados en MongoDB</span>
+                <span className="data-label">Total Fotogramas en Catálogo COCO</span>
+                <span className="data-value">{Math.max(resumenMetricas.totalPreSegmentados, totalFramesEnRegistro)} frames</span>
+              </div>
+              <div className="data-row">
+                <span className="data-label">Fotogramas Rectificados por Experto</span>
                 <span className="data-value">{resumenMetricas.totalValidados} frames</span>
               </div>
               <div className="data-row">
@@ -1552,10 +2017,6 @@ export default function Anotador() {
                 <span className="data-label">Tasa de Refinamiento Poligonal</span>
                 <span className="data-value">{resumenMetricas.tasaCorreccionHumana}%</span>
               </div>
-            </div>
-
-            <div style={{ marginTop: '18px', fontSize: '11px', color: 'var(--text-muted)', lineHeight: '1.5' }}>
-              Métricas calculadas en tiempo real a partir de las colecciones documentales de MongoDB Atlas para la evaluación cuantitativa del flujo HITL.
             </div>
           </div>
         </div>

@@ -36,12 +36,12 @@ router.get('/frame/:frameId', async (req, res) => {
   }
 });
 
-// 2. Obtener todas las validaciones (para exportación COCO y métricas HITL)
+// 2. Obtener todas las anotaciones de una secuencia
 router.get('/', async (req, res) => {
   try {
     const { secuencia } = req.query;
     const filtro = secuencia ? { frameId: { $regex: `^${secuencia}` } } : {};
-    const anotaciones = await ThermalData.find(filtro).sort({ updatedAt: -1 });
+    const anotaciones = await ThermalData.find(filtro).sort({ frameId: 1 });
     res.status(200).json(anotaciones);
   } catch (error) {
     console.error('Error al obtener anotaciones:', error);
@@ -49,12 +49,13 @@ router.get('/', async (req, res) => {
   }
 });
 
-// 3. Guardar validación HITL (Pre-etiqueta + Corrección Experta + Métricas)
+// 3. Guardar o rectificar un fotograma individual (HITL)
 router.post('/', async (req, res) => {
   try {
     const {
       frameId,
       imageUrl,
+      estado,
       tipoValidacion,
       aprobadoBinario,
       poligonoPreEtiquetado,
@@ -78,7 +79,7 @@ router.post('/', async (req, res) => {
       {
         frameId,
         imageUrl: imageUrl || `/dataset/${frameId}.png`,
-        estado: 'Revisado',
+        estado: estado || 'Revisado',
         tipoValidacion,
         aprobadoBinario,
         poligonoPreEtiquetado: poligonoPreEtiquetado || [],
@@ -94,8 +95,8 @@ router.post('/', async (req, res) => {
           iouSimilitud: iouSimilitud ?? 100,
           tiempoValidacionSeg: tiempoValidacionSeg || 0,
           umbralRadiometrico: umbralRadiometrico || 0,
-          direccionSoldadura: direccionSoldadura || 'Izquierda a Derecha',
-          material: material || 'Acero Inoxidable 304L',
+          direccionSoldadura: direccionSoldadura || 'Derecha a Izquierda',
+          material: material || 'Acero Inoxidable',
           numeroCordones: numeroCordones || 1
         }
       },
@@ -109,6 +110,62 @@ router.post('/', async (req, res) => {
   } catch (error) {
     console.error('Error al guardar en MongoDB:', error);
     res.status(500).json({ error: 'Error interno al guardar en MongoDB' });
+  }
+});
+
+// 4. NUEVO: Sincronización por Lote (Guarda múltiples frames pre-procesados sin sobrescribir los ya rectificados por el experto)
+router.post('/batch', async (req, res) => {
+  try {
+    const { frames } = req.body;
+    if (!Array.isArray(frames) || frames.length === 0) {
+      return res.status(400).json({ error: 'No se recibieron fotogramas para procesar en lote.' });
+    }
+
+    const operaciones = frames.map((item) => {
+      const geometria = calcularGeometria(item.poligono);
+      return {
+        updateOne: {
+          filter: { frameId: item.frameId, estado: { $ne: 'Revisado' } },
+          update: {
+            $setOnInsert: {
+              frameId: item.frameId,
+              imageUrl: item.imageUrl || `/dataset/${item.frameId}.png`,
+              estado: 'Pendiente',
+              tipoValidacion: 'Ninguna',
+              aprobadoBinario: null,
+              poligonoPreEtiquetado: item.poligonoPreEtiquetado || item.poligono || [],
+              poligono: item.poligono || [],
+              validadorId: item.validadorId || 'auto_presegmentacion',
+              metadatos: {
+                tempMaxima: item.tempMaxima || 7082,
+                tempPromedio: item.tempPromedio || 5800,
+                areaPixeles: geometria.area,
+                perimetroPixeles: geometria.perimetro,
+                incertidumbreAlgoritmo: item.incertidumbreAlgoritmo || 12.0,
+                iouSimilitud: 100,
+                tiempoValidacionSeg: 0,
+                umbralRadiometrico: item.umbralRadiometrico || 218,
+                direccionSoldadura: item.direccionSoldadura || 'Derecha a Izquierda',
+                material: item.material || 'Acero Inoxidable',
+                numeroCordones: item.numeroCordones || 1
+              }
+            }
+          },
+          upsert: true
+        }
+      };
+    });
+
+    const resultado = await ThermalData.bulkWrite(operaciones, { ordered: false }).catch(() => null);
+
+    res.status(200).json({
+      mensaje: 'Lote de fotogramas registrado exitosamente',
+      procesados: frames.length,
+      detalle: resultado ? resultado.upsertedCount : frames.length
+    });
+  } catch (error) {
+    console.error('Error en guardado masivo:', error);
+    res.status(500).json({ error: 'Error al procesar el lote de fotogramas' });
   }
 });
 
